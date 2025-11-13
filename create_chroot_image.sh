@@ -1,314 +1,485 @@
-#!/usr/bin/env bash
-#
-# create_chroot_image.sh
-#
-# Creates a Debian/Ubuntu chroot with Synaptic, lets user pick a DE via Synaptic,
-# updates the chroot, and copies it into a raw EFI-bootable disk image for USB.
-#
-# Usage: sudo ./create_chroot_image.sh
-#
-set -euo pipefail
-IFS=$'\n\t'
+#!/bin/bash
 
-# ---------- Configuration ----------
-CHROOT_DIR="${PWD}/chroot"        # where debootstrap will create the chroot
-IMAGE_FILE="${PWD}/usb_image.img" # output raw image (will be overwritten)
-IMAGE_SIZE="4G"                   # default image size (changeable on prompt)
-ARCH="amd64"
-HOST_DEPS=(debootstrap qemu-utils parted dosfstools gdisk mtools kpartx rsync xauth x11-xserver-utils wget curl apt-transport-https)
-# ---------- End configuration ----------
+# Custom Distro Builder Script
+# This script creates a custom Debian/Ubuntu distribution with user-selected packages
 
-# Utility: print and exit on error
-err() { echo "ERROR: $*" >&2; exit 1; }
+set -e  # Exit on any error
 
-# Ensure running as root
-if [ "$(id -u)" -ne 0 ]; then
-  err "This script must be run as root (sudo)."
-fi
+# Colors for output
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+YELLOW='\033[1;33m'
+BLUE='\033[0;34m'
+NC='\033[0m' # No Color
 
-# 0. Install necessary packages on host
-echo "Installing required host packages..."
-apt-get update
-apt-get install -y "${HOST_DEPS[@]}"
-
-# Prompt distro family
-echo
-PS3="Choose the distro family to debootstrap into the chroot: "
-options=("Debian" "Ubuntu" "Quit")
-select distro_family in "${options[@]}"; do
-  case "$distro_family" in
-    Debian|Ubuntu) break ;;
-    Quit) echo "Aborted by user."; exit 1 ;;
-    *) echo "Invalid selection." ;;
-  esac
-done
-
-# Provide suites depending on family
-declare -a suites
-if [ "$distro_family" = "Debian" ]; then
-  suites=(bookworm bullseye buster bookworm-backports)
-elif [ "$distro_family" = "Ubuntu" ]; then
-  suites=(jammy focal kinetic impish)
-fi
-
-echo "Available suites for $distro_family:"
-select suite in "${suites[@]}" "Quit"; do
-  if [ "$suite" = "Quit" ]; then echo "Aborted by user."; exit 1; fi
-  if [[ -n "$suite" ]]; then break; fi
-  echo "Invalid selection."
-done
-
-echo "Selected: $distro_family $suite"
-echo
-
-# Confirm or change CHROOT_DIR
-read -rp "Chroot target directory (default: ${CHROOT_DIR}): " input
-CHROOT_DIR="${input:-$CHROOT_DIR}"
-
-mkdir -p "$CHROOT_DIR"
-
-# 1-2. Debootstrap the system chroot
-echo "Starting debootstrap of $distro_family $suite into $CHROOT_DIR ..."
-if [ "$distro_family" = "Debian" ]; then
-  debootstrap --arch="$ARCH" --variant=minbase "$suite" "$CHROOT_DIR" http://deb.debian.org/debian/
-else
-  debootstrap --arch="$ARCH" --variant=minbase "$suite" "$CHROOT_DIR" http://archive.ubuntu.com/ubuntu/
-fi
-echo "debootstrap finished."
-
-# Basic bind mounts
-mount_bind() {
-  mount --bind /dev "$CHROOT_DIR/dev"
-  mount --bind /dev/pts "$CHROOT_DIR/dev/pts"
-  mount -t proc /proc "$CHROOT_DIR/proc"
-  mount -t sysfs /sys "$CHROOT_DIR/sys"
-  # copy resolv for networking in chroot
-  cp -L /etc/resolv.conf "$CHROOT_DIR/etc/resolv.conf"
-}
-umount_bind() {
-  set +e
-  umount -l "$CHROOT_DIR/dev/pts" || true
-  umount -l "$CHROOT_DIR/dev" || true
-  umount -l "$CHROOT_DIR/proc" || true
-  umount -l "$CHROOT_DIR/sys" || true
-  set -e
+# Function to print colored output
+print_status() {
+    echo -e "${BLUE}[INFO]${NC} $1"
 }
 
-mount_bind
+print_success() {
+    echo -e "${GREEN}[SUCCESS]${NC} $1"
+}
 
-# Minimal /etc/apt/sources.list in chroot
-cat > "$CHROOT_DIR/etc/apt/sources.list" <<EOF
-deb $( [ "$distro_family" = "Debian" ] && echo "http://deb.debian.org/debian" || echo "http://archive.ubuntu.com/ubuntu" ) $suite main restricted universe multiverse
-deb-src $( [ "$distro_family" = "Debian" ] && echo "http://deb.debian.org/debian" || echo "http://archive.ubuntu.com/ubuntu" ) $suite main restricted universe multiverse
-EOF
+print_warning() {
+    echo -e "${YELLOW}[WARNING]${NC} $1"
+}
 
-# Prepare chroot environment: create a minimal locale and utilities
-chroot_cmd() { chroot "$CHROOT_DIR" /bin/bash -lc "$*"; }
-echo "Preparing chroot (apt update, install base utilities)..."
-chroot_cmd "apt-get update"
-chroot_cmd "DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends apt-utils dialog locales ca-certificates gnupg2 wget curl"
+print_error() {
+    echo -e "${RED}[ERROR]${NC} $1"
+}
 
-# Set locale (optional)
-chroot_cmd "locale-gen en_US.UTF-8 || true"
-chroot_cmd "update-ca-certificates || true"
-
-# 3. Automatically install Synaptic in the chroot
-echo "Installing Synaptic and GUI helpers inside chroot..."
-chroot_cmd "DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends synaptic dbus-x11 x11-utils xauth sudo"
-
-# Create a normal user for convenience (not strictly necessary)
-CHROOT_USER="user"
-chroot_cmd "id -u $CHROOT_USER >/dev/null 2>&1 || (useradd -m -s /bin/bash $CHROOT_USER && echo '$CHROOT_USER:password' | chpasswd)"
-
-# 4. Let the user select a Desktop Environment based on availability
-echo
-echo "Now let's determine available desktop meta-packages in the chroot and optionally install one."
-DESKTOP_OPTIONS=(
-  "GNOME (task-gnome-desktop / ubuntu-desktop)"
-  "KDE/Plasma (task-kde-desktop / kde-standard)"
-  "XFCE (task-xfce-desktop / xubuntu-desktop)"
-  "LXDE (task-lxde-desktop / lubuntu-desktop)"
-  "MATE (task-mate-desktop / ubuntu-mate-desktop)"
-  "Cinnamon (cinnamon)"
-  "None / Skip"
-)
-
-PS3="Select a desktop environment to install into the chroot (installation may be large): "
-select de_choice in "${DESKTOP_OPTIONS[@]}"; do
-  case "$de_choice" in
-    "GNOME"*) DE_PKGS=("task-gnome-desktop" "ubuntu-desktop"); break ;;
-    "KDE"*) DE_PKGS=("task-kde-desktop" "kde-standard" "kubuntu-desktop"); break ;;
-    "XFCE"*) DE_PKGS=("task-xfce-desktop" "xubuntu-desktop" "xfce4"); break ;;
-    "LXDE"*) DE_PKGS=("task-lxde-desktop" "lubuntu-desktop" "lxde"); break ;;
-    "MATE"*) DE_PKGS=("task-mate-desktop" "ubuntu-mate-desktop" "mate-desktop-environment"); break ;;
-    "Cinnamon"*) DE_PKGS=("cinnamon" "cinnamon-desktop-environment"); break ;;
-    "None / Skip") DE_PKGS=(); break ;;
-    *) echo "Invalid selection." ;;
-  esac
-done
-
-if [ "${#DE_PKGS[@]}" -gt 0 ]; then
-  # Find the first available package in the chroot apt.
-  echo "Checking which desktop meta-package is available in the chroot..."
-  AVAILABLE=""
-  for p in "${DE_PKGS[@]}"; do
-    if chroot_cmd "apt-cache show $p >/dev/null 2>&1"; then
-      AVAILABLE="$p"
-      break
+# Function to check if running as root
+check_root() {
+    if [[ $EUID -eq 0 ]]; then
+        print_error "This script should not be run as root. Run as regular user."
+        exit 1
     fi
-  done
+}
 
-  if [ -z "$AVAILABLE" ]; then
-    echo "No preferred desktop meta-package from the list seems available. You can still install using Synaptic later."
-  else
-    echo "The package '$AVAILABLE' is available. Installing it now (this may take a while)..."
-    chroot_cmd "DEBIAN_FRONTEND=noninteractive apt-get install -y $AVAILABLE"
-  fi
-else
-  echo "Skipping desktop package installation. You can install packages later from Synaptic."
-fi
+# Function to install necessary packages
+install_dependencies() {
+    print_status "Installing necessary packages..."
+    
+    # Check if we're on Debian/Ubuntu
+    if ! command -v apt-get &> /dev/null; then
+        print_error "This script requires Debian/Ubuntu based system"
+        exit 1
+    fi
+    
+    # Update package list
+    sudo apt-get update
+    
+    # Install required packages
+    sudo apt-get install -y \
+        debootstrap \
+        schroot \
+        squashfs-tools \
+        genisoimage \
+        syslinux-utils \
+        mtools \
+        dosfstools \
+        grub-efi-amd64-bin \
+        grub-pc-bin \
+        xorriso
+    
+    print_success "Dependencies installed successfully"
+}
 
-# 5. Open Synaptic and let the user pick/install packages
-echo
-echo "To run Synaptic inside the chroot so you can select additional packages graphically,"
-echo "the script will allow the root user local X access temporarily."
-echo
-read -rp "Press ENTER to start Synaptic in the chroot (or Ctrl-C to cancel) ..."
+# Function to select distribution
+select_distribution() {
+    echo ""
+    echo "=== Distribution Selection ==="
+    echo "1. Ubuntu (Latest LTS)"
+    echo "2. Debian (Latest Stable)"
+    echo ""
+    
+    while true; do
+        read -p "Select distribution (1-2): " distro_choice
+        case $distro_choice in
+            1)
+                DISTRO="ubuntu"
+                SUITE="jammy"  # Ubuntu 22.04 LTS
+                MIRROR="http://archive.ubuntu.com/ubuntu/"
+                print_status "Selected: Ubuntu 22.04 LTS (Jammy)"
+                break
+                ;;
+            2)
+                DISTRO="debian"
+                SUITE="bullseye"  # Debian 11
+                MIRROR="http://deb.debian.org/debian/"
+                print_status "Selected: Debian 11 (Bullseye)"
+                break
+                ;;
+            *)
+                print_error "Invalid choice. Please select 1 or 2."
+                ;;
+        esac
+    done
+}
 
-# Allow local root X access, run synaptic inside chroot, then revoke access
-# using xhost +SI:localuser:root is safer than xhost +
-xhost +SI:localuser:root || echo "Warning: could not modify xhost permissions; if Synaptic fails to start, consider running 'xhost +SI:localuser:root' in host session."
+# Function to select desktop environment
+select_desktop_environment() {
+    echo ""
+    echo "=== Desktop Environment Selection ==="
+    
+    if [[ "$DISTRO" == "ubuntu" ]]; then
+        echo "Available Desktop Environments:"
+        echo "1. GNOME (Default Ubuntu desktop)"
+        echo "2. KDE Plasma"
+        echo "3. XFCE"
+        echo "4. LXQt"
+        echo "5. MATE"
+        echo "6. None (Minimal system)"
+        echo ""
+        
+        while true; do
+            read -p "Select desktop environment (1-6): " de_choice
+            case $de_choice in
+                1)
+                    DESKTOP_PACKAGE="ubuntu-desktop"
+                    DESKTOP_NAME="GNOME"
+                    break
+                    ;;
+                2)
+                    DESKTOP_PACKAGE="kde-plasma-desktop"
+                    DESKTOP_NAME="KDE Plasma"
+                    break
+                    ;;
+                3)
+                    DESKTOP_PACKAGE="xfce4"
+                    DESKTOP_NAME="XFCE"
+                    break
+                    ;;
+                4)
+                    DESKTOP_PACKAGE="lxqt"
+                    DESKTOP_NAME="LXQt"
+                    break
+                    ;;
+                5)
+                    DESKTOP_PACKAGE="ubuntu-mate-desktop"
+                    DESKTOP_NAME="MATE"
+                    break
+                    ;;
+                6)
+                    DESKTOP_PACKAGE=""
+                    DESKTOP_NAME="None"
+                    break
+                    ;;
+                *)
+                    print_error "Invalid choice. Please select 1-6."
+                    ;;
+            esac
+        done
+    else  # Debian
+        echo "Available Desktop Environments:"
+        echo "1. GNOME"
+        echo "2. KDE Plasma"
+        echo "3. XFCE"
+        echo "4. LXDE"
+        echo "5. MATE"
+        echo "6. Cinnamon"
+        echo "7. None (Minimal system)"
+        echo ""
+        
+        while true; do
+            read -p "Select desktop environment (1-7): " de_choice
+            case $de_choice in
+                1)
+                    DESKTOP_PACKAGE="task-gnome-desktop"
+                    DESKTOP_NAME="GNOME"
+                    break
+                    ;;
+                2)
+                    DESKTOP_PACKAGE="task-kde-desktop"
+                    DESKTOP_NAME="KDE Plasma"
+                    break
+                    ;;
+                3)
+                    DESKTOP_PACKAGE="task-xfce-desktop"
+                    DESKTOP_NAME="XFCE"
+                    break
+                    ;;
+                4)
+                    DESKTOP_PACKAGE="task-lxde-desktop"
+                    DESKTOP_NAME="LXDE"
+                    break
+                    ;;
+                5)
+                    DESKTOP_PACKAGE="task-mate-desktop"
+                    DESKTOP_NAME="MATE"
+                    break
+                    ;;
+                6)
+                    DESKTOP_PACKAGE="task-cinnamon-desktop"
+                    DESKTOP_NAME="Cinnamon"
+                    break
+                    ;;
+                7)
+                    DESKTOP_PACKAGE=""
+                    DESKTOP_NAME="None"
+                    break
+                    ;;
+                *)
+                    print_error "Invalid choice. Please select 1-7."
+                    ;;
+            esac
+        done
+    fi
+    
+    print_status "Selected: $DESKTOP_NAME"
+}
 
-# Try a few possible synaptic binary paths inside chroot
-SYNAPTIC_PATHS=("/usr/sbin/synaptic" "/usr/bin/synaptic" "/usr/sbin/synaptic-pkexec")
-SYNAPTIC_FOUND=""
-for p in "${SYNAPTIC_PATHS[@]}"; do
-  if chroot_cmd "[ -x $p ] && echo ok"; then
-    SYNAPTIC_FOUND="$p"
-    break
-  fi
-done
+# Function to debootstrap the system
+debootstrap_system() {
+    print_status "Creating chroot directory..."
+    CHROOT_DIR="$(pwd)/${DISTRO}_chroot"
+    
+    if [[ -d "$CHROOT_DIR" ]]; then
+        print_warning "Chroot directory already exists. Removing..."
+        sudo rm -rf "$CHROOT_DIR"
+    fi
+    
+    print_status "Debootstrapping $DISTRO $SUITE..."
+    sudo debootstrap --arch=amd64 "$SUITE" "$CHROOT_DIR" "$MIRROR"
+    
+    if [[ $? -eq 0 ]]; then
+        print_success "Debootstrap completed successfully"
+    else
+        print_error "Debootstrap failed"
+        exit 1
+    fi
+}
 
-if [ -z "$SYNAPTIC_FOUND" ]; then
-  echo "Synaptic binary not found inside chroot. Attempting to install again..."
-  chroot_cmd "DEBIAN_FRONTEND=noninteractive apt-get install -y synaptic"
-  if chroot_cmd "[ -x /usr/sbin/synaptic ] && echo ok"; then
-    SYNAPTIC_FOUND="/usr/sbin/synaptic"
-  else
-    err "Synaptic still not available in chroot. Exiting."
-  fi
-fi
+# Function to configure chroot
+configure_chroot() {
+    print_status "Configuring chroot environment..."
+    
+    # Copy resolv.conf for network access
+    sudo cp /etc/resolv.conf "$CHROOT_DIR/etc/"
+    
+    # Set up sources.list
+    if [[ "$DISTRO" == "ubuntu" ]]; then
+        sudo tee "$CHROOT_DIR/etc/apt/sources.list" > /dev/null <<EOF
+deb http://archive.ubuntu.com/ubuntu/ $SUITE main restricted universe multiverse
+deb http://archive.ubuntu.com/ubuntu/ $SUITE-updates main restricted universe multiverse
+deb http://archive.ubuntu.com/ubuntu/ $SUITE-security main restricted universe multiverse
+EOF
+    else
+        sudo tee "$CHROOT_DIR/etc/apt/sources.list" > /dev/null <<EOF
+deb http://deb.debian.org/debian/ $SUITE main contrib non-free
+deb http://deb.debian.org/debian/ $SUITE-updates main contrib non-free
+deb http://security.debian.org/debian-security $SUITE-security main contrib non-free
+EOF
+    fi
+    
+    # Mount necessary filesystems
+    sudo mount --bind /proc "$CHROOT_DIR/proc"
+    sudo mount --bind /sys "$CHROOT_DIR/sys"
+    sudo mount --bind /dev "$CHROOT_DIR/dev"
+    sudo mount --bind /dev/pts "$CHROOT_DIR/dev/pts"
+}
 
-echo "Launching Synaptic in chroot (close Synaptic window to continue)..."
-# Run synaptic as root inside the chroot. DISPLAY is inherited by chroot via environment replacement.
-export DISPLAY="${DISPLAY:-:0}"
-chroot "$CHROOT_DIR" /bin/bash -lc "export DISPLAY=${DISPLAY}; export TERM=${TERM:-xterm}; dbus-launch $SYNAPTIC_FOUND" || true
+# Function to install base system
+install_base_system() {
+    print_status "Installing base system in chroot..."
+    
+    # Update package lists
+    sudo chroot "$CHROOT_DIR" apt-get update
+    
+    # Install essential packages
+    sudo chroot "$CHROOT_DIR" apt-get install -y \
+        sudo \
+        locales \
+        keyboard-configuration \
+        console-setup \
+        network-manager \
+        dbus-x11 \
+        pulseaudio
+    
+    # Set locale
+    sudo chroot "$CHROOT_DIR" locale-gen en_US.UTF-8
+    sudo chroot "$CHROOT_DIR" update-locale LANG=en_US.UTF-8
+    
+    # Install Synaptic
+    print_status "Installing Synaptic..."
+    sudo chroot "$CHROOT_DIR" apt-get install -y synaptic
+    
+    # Install selected desktop environment
+    if [[ -n "$DESKTOP_PACKAGE" ]]; then
+        print_status "Installing $DESKTOP_NAME desktop environment..."
+        sudo chroot "$CHROOT_DIR" apt-get install -y "$DESKTOP_PACKAGE"
+    fi
+    
+    # Install additional useful packages
+    sudo chroot "$CHROOT_DIR" apt-get install -y \
+        firefox-esr \
+        file-manager \
+        text-editor \
+        terminal
+    
+    print_success "Base system installation completed"
+}
 
-# Revoke X access
-xhost -SI:localuser:root || true
+# Function to run Synaptic for package selection
+run_synaptic() {
+    print_status "Starting Synaptic for package selection..."
+    echo ""
+    echo "=== Synaptic Package Manager ==="
+    echo "You can now use Synaptic to select additional packages."
+    echo "When you're done, close Synaptic to continue."
+    echo ""
+    
+    # Set up X11 forwarding for GUI applications
+    export DISPLAY=:0
+    
+    # Run Synaptic in chroot (requires X11 forwarding)
+    if command -v xhost &> /dev/null; then
+        xhost +local:root > /dev/null 2>&1
+        sudo chroot "$CHROOT_DIR" synaptic
+        xhost -local:root > /dev/null 2>&1
+    else
+        print_warning "X11 not available. Cannot run Synaptic GUI."
+        print_status "You can manually install packages using apt in the chroot."
+        echo ""
+        echo "To manually install packages, run:"
+        echo "  sudo chroot $CHROOT_DIR apt install <package-name>"
+        echo ""
+        read -p "Press Enter to continue without Synaptic..."
+    fi
+}
 
-echo "Synaptic closed (or returned). Proceeding to update the chroot."
+# Function to update chroot
+update_chroot() {
+    print_status "Updating chroot system..."
+    
+    sudo chroot "$CHROOT_DIR" apt-get update
+    sudo chroot "$CHROOT_DIR" apt-get upgrade -y
+    sudo chroot "$CHROOT_DIR" apt-get autoremove -y
+    sudo chroot "$CHROOT_DIR" apt-get clean
+    
+    print_success "Chroot updated successfully"
+}
 
-# 6. After Synaptic closes, update and upgrade the chroot
-echo "Updating and upgrading packages inside chroot..."
-chroot_cmd "apt-get update"
-chroot_cmd "DEBIAN_FRONTEND=noninteractive apt-get -y upgrade"
-chroot_cmd "DEBIAN_FRONTEND=noninteractive apt-get -y dist-upgrade || true"
-chroot_cmd "DEBIAN_FRONTEND=noninteractive apt-get -y autoremove"
-chroot_cmd "apt-get clean"
+# Function to create bootable USB image
+create_bootable_image() {
+    print_status "Creating bootable USB image..."
+    
+    IMAGE_NAME="${DISTRO}_custom_$(date +%Y%m%d_%H%M%S).img"
+    IMAGE_SIZE="4G"  # 4GB image size
+    
+    # Create disk image
+    print_status "Creating disk image file: $IMAGE_NAME"
+    dd if=/dev/zero of="$IMAGE_NAME" bs=1M count=$((4 * 1024)) status=progress
+    
+    # Partition the image
+    print_status "Partitioning disk image..."
+    parted "$IMAGE_NAME" mklabel gpt
+    parted "$IMAGE_NAME" mkpart primary fat32 1MiB 513MiB
+    parted "$IMAGE_NAME" set 1 esp on
+    parted "$IMAGE_NAME" mkpart primary ext4 513MiB 100%
+    
+    # Set up loop device
+    LOOP_DEV=$(sudo losetup --find --show --partscan "$IMAGE_NAME")
+    
+    # Format partitions
+    print_status "Formatting partitions..."
+    sudo mkfs.fat -F32 "${LOOP_DEV}p1"
+    sudo mkfs.ext4 "${LOOP_DEV}p2"
+    
+    # Mount partitions
+    print_status "Mounting partitions..."
+    MOUNT_DIR="/mnt/custom_distro"
+    sudo mkdir -p "$MOUNT_DIR"
+    sudo mount "${LOOP_DEV}p2" "$MOUNT_DIR"
+    sudo mkdir -p "$MOUNT_DIR/boot/efi"
+    sudo mount "${LOOP_DEV}p1" "$MOUNT_DIR/boot/efi"
+    
+    # Copy chroot to image
+    print_status "Copying system to disk image..."
+    sudo cp -a "$CHROOT_DIR/"* "$MOUNT_DIR/"
+    
+    # Install bootloader
+    print_status "Installing GRUB bootloader..."
+    sudo chroot "$MOUNT_DIR" grub-install --target=x86_64-efi --efi-directory=/boot/efi --bootloader-id="$DISTRO" --recheck
+    sudo chroot "$MOUNT_DIR" update-grub
+    
+    # Configure fstab
+    print_status "Configuring fstab..."
+    sudo tee "$MOUNT_DIR/etc/fstab" > /dev/null <<EOF
+# <file system> <mount point>   <type>  <options>       <dump>  <pass>
+UUID=$(sudo blkid -s UUID -o value "${LOOP_DEV}p1") /boot/efi vfat umask=0077 0 1
+UUID=$(sudo blkid -s UUID -o value "${LOOP_DEV}p2") / ext4 errors=remount-ro 0 1
+EOF
+    
+    # Clean up
+    print_status "Cleaning up..."
+    sudo umount "$MOUNT_DIR/boot/efi"
+    sudo umount "$MOUNT_DIR"
+    sudo losetup -d "$LOOP_DEV"
+    
+    print_success "Bootable USB image created: $IMAGE_NAME"
+}
 
-# 7. Copy the chroot to a raw disk image (EFI support)
-echo
-read -rp "Ready to create a raw disk image from the chroot for USB boot (size default ${IMAGE_SIZE}). Press ENTER to continue or Ctrl-C to cancel." tmp
+# Function to clean up
+cleanup() {
+    print_status "Cleaning up..."
+    
+    # Unmount filesystems
+    if mountpoint -q "$CHROOT_DIR/proc"; then
+        sudo umount "$CHROOT_DIR/proc"
+    fi
+    if mountpoint -q "$CHROOT_DIR/sys"; then
+        sudo umount "$CHROOT_DIR/sys"
+    fi
+    if mountpoint -q "$CHROOT_DIR/dev/pts"; then
+        sudo umount "$CHROOT_DIR/dev/pts"
+    fi
+    if mountpoint -q "$CHROOT_DIR/dev"; then
+        sudo umount "$CHROOT_DIR/dev"
+    fi
+    
+    print_success "Cleanup completed"
+}
 
-read -rp "Enter image file path (default: ${IMAGE_FILE}): " input
-IMAGE_FILE="${input:-$IMAGE_FILE}"
+# Main execution
+main() {
+    echo ""
+    echo "========================================"
+    echo "    Custom Distro Builder Script"
+    echo "========================================"
+    echo ""
+    
+    # Check if running as root
+    check_root
+    
+    # Step 0: Install dependencies
+    install_dependencies
+    
+    # Step 1: Select distribution
+    select_distribution
+    
+    # Step 2: Debootstrap system
+    debootstrap_system
+    
+    # Step 3: Configure chroot
+    configure_chroot
+    
+    # Step 4: Install base system and Synaptic
+    install_base_system
+    
+    # Step 5: Select desktop environment
+    select_desktop_environment
+    
+    # Step 6: Run Synaptic for package selection
+    run_synaptic
+    
+    # Step 7: Update chroot
+    update_chroot
+    
+    # Step 8: Create bootable USB image
+    create_bootable_image
+    
+    # Cleanup
+    cleanup
+    
+    echo ""
+    echo "========================================"
+    echo "    Build Process Completed!"
+    echo "========================================"
+    echo ""
+    echo "Your custom $DISTRO distribution with $DESKTOP_NAME is ready!"
+    echo "Bootable image: $(pwd)/${DISTRO}_custom_*.img"
+    echo ""
+    echo "To write to USB drive, use:"
+    echo "  sudo dd if=${DISTRO}_custom_*.img of=/dev/sdX bs=4M status=progress"
+    echo ""
+    echo "Replace /dev/sdX with your USB device (be careful!)"
+    echo ""
+}
 
-read -rp "Enter image size (e.g. 4G) default ${IMAGE_SIZE}: " input
-IMAGE_SIZE="${input:-$IMAGE_SIZE}"
+# Handle script interruption
+trap cleanup EXIT
 
-echo "Creating raw image ${IMAGE_FILE} of size ${IMAGE_SIZE}..."
-qemu-img create -f raw "$IMAGE_FILE" "$IMAGE_SIZE"
-
-# Associate loop device and partition
-LOOPDEV=$(losetup --show -fP "$IMAGE_FILE")
-if [ -z "$LOOPDEV" ]; then err "Failed to create loop device."; fi
-echo "Loop device: $LOOPDEV"
-
-# Partition: GPT, 1) EFI FAT32 512MiB, 2) ext4 root the rest
-parted -s "$LOOPDEV" mklabel gpt
-parted -s "$LOOPDEV" mkpart ESP fat32 1MiB 513MiB
-parted -s "$LOOPDEV" set 1 boot on
-parted -s "$LOOPDEV" mkpart primary ext4 513MiB 100%
-
-# Wait for kernel to refresh partitions
-sleep 1
-# Partition device names: on modern systems it's e.g. /dev/loop0p1
-PART1="${LOOPDEV}p1"
-PART2="${LOOPDEV}p2"
-if [ ! -b "$PART1" ]; then
-  # fallback for systems that use /dev/loop0 (no 'p'), use kpartx to create
-  kpartx -a "$LOOPDEV"
-  sleep 1
-  # list mapped devices
-  MAPPEDS=$(ls /dev/mapper | grep "$(basename "$LOOPDEV" | sed 's/loop//')")
-  PART1="/dev/mapper/$(basename "$LOOPDEV")p1" # attempt; this may vary
-fi
-
-# Format partitions
-mkfs.vfat -F32 -n EFI "$PART1"
-mkfs.ext4 -F -L ROOTFS "$PART2"
-
-# Mount partitions
-MNTDIR=$(mktemp -d)
-mkdir -p "$MNTDIR/boot/efi"
-mount "$PART2" "$MNTDIR"
-mkdir -p "$MNTDIR/boot/efi"
-mount "$PART1" "$MNTDIR/boot/efi"
-
-# Rsync chroot to image rootfs
-echo "Copying chroot filesystem to image root partition (this may take a while)..."
-rsync -aAX --exclude={"/dev/*","/proc/*","/sys/*","/tmp/*","/run/*","/mnt/*","/media/*","/lost+found"} "$CHROOT_DIR/" "$MNTDIR/"
-
-# Prepare for chroot into new image to install the bootloader (GRUB EFI)
-for bd in dev dev/pts proc sys run; do
-  mount --bind "/$bd" "$MNTDIR/$bd"
-done
-
-# Ensure /boot/efi exists and is mounted (we already mounted it)
-# Install grub-efi-amd64 inside the image (chroot)
-echo "Installing grub-efi inside the image chroot..."
-chroot "$MNTDIR" /bin/bash -lc "apt-get update && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends grub-efi-amd64 shim-signed linux-image-amd64 || apt-get install -y --no-install-recommends grub-efi linux-image-amd64 || true"
-
-# Attempt grub-install --removable to place grub in EFI/BOOT/BOOTX64.EFI
-echo "Running grub-install (removable) ..."
-chroot "$MNTDIR" /bin/bash -lc "grub-install --target=x86_64-efi --efi-directory=/boot/efi --boot-directory=/boot --removable --recheck || true"
-chroot "$MNTDIR" /bin/bash -lc "update-grub || true"
-
-# Cleanup mounts
-echo "Cleaning up mounts..."
-for bd in dev/pts dev proc sys run; do
-  umount -l "$MNTDIR/$bd" || true
-done
-umount -l "$MNTDIR/boot/efi" || true
-umount -l "$MNTDIR" || true
-losetup -d "$LOOPDEV" || true
-kpartx -d "$LOOPDEV" || true
-rmdir "$MNTDIR" || true
-
-echo "Image $IMAGE_FILE created and (attempted) configured for EFI boot."
-echo "You can dd this file to a USB device (be careful!):"
-echo "  dd if=${IMAGE_FILE} of=/dev/sdX bs=4M status=progress oflag=sync"
-echo
-echo "Notes / Caveats:"
-echo " - Installing a working bootloader inside an image can be tricky on some hosts."
-echo " - If grub-install failed or the image does not boot on your target, you may need to"
-echo "   chroot into the image on a system that supports EFI and re-run grub-install."
-echo " - The image contains the packages you installed via Synaptic; further customization is possible."
-echo
-echo "Done."
-
-# Unmount any leftover binds on the original chroot
-umount_bind
-
-exit 0
+# Run main function
+main "$@"
